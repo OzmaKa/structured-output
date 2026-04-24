@@ -2,6 +2,8 @@ from dotenv import load_dotenv
 import cohere
 import os
 import json
+import ast
+import operator
 from pydantic import BaseModel, model_validator
 
 load_dotenv()
@@ -19,7 +21,7 @@ class CodeReview(BaseModel):
         self.approved = self.score >= 7
         return self
 
-# ── Tool definitions — the LLM reads these to decide which tool to call ───────
+# ── Tool definitions ───────────────────────────────────────────────────────────
 tools = [
     {
         "type": "function",
@@ -57,16 +59,42 @@ tools = [
     }
 ]
 
+# ── Safe math evaluator (no eval) ─────────────────────────────────────────────
+ALLOWED_OPS = {
+    ast.Add:  operator.add,
+    ast.Sub:  operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div:  operator.truediv,
+    ast.Pow:  operator.pow,
+    ast.USub: operator.neg,
+}
+
+def safe_eval(expr: str):
+    tree = ast.parse(expr, mode='eval')
+    return _eval(tree.body)
+
+def _eval(node):
+    if isinstance(node, ast.Constant):
+        return node.value
+    elif isinstance(node, ast.BinOp):
+        op = ALLOWED_OPS.get(type(node.op))
+        if op is None:
+            raise ValueError("Operation not allowed")
+        return op(_eval(node.left), _eval(node.right))
+    elif isinstance(node, ast.UnaryOp):
+        op = ALLOWED_OPS.get(type(node.op))
+        return op(_eval(node.operand))
+    else:
+        raise ValueError(f"Expression not allowed: {type(node)}")
+
 # ── Tool implementations ───────────────────────────────────────────────────────
 def calculate(expression: str) -> str:
-    # replace ^ with ** so 3^8 works as expected
     expression = expression.replace("^", "**")
-    result = eval(expression)
+    result = safe_eval(expression)
     return str(result)
 
 def review_code(code: str) -> dict:
     co = cohere.ClientV2(api_key)
-
     answer = co.chat(
         model="command-r-plus-08-2024",
         messages=[
@@ -86,16 +114,12 @@ def review_code(code: str) -> dict:
             }
         ]
     )
-
     raw_text = answer.message.content[0].text.strip()
-
-    # strip markdown backticks if Cohere wraps the JSON
     if raw_text.startswith("```"):
         raw_text = raw_text.split("```")[1]
         if raw_text.startswith("json"):
             raw_text = raw_text[4:]
     raw_text = raw_text.strip()
-
     try:
         data = json.loads(raw_text)
         result = CodeReview(**data)
@@ -103,60 +127,63 @@ def review_code(code: str) -> dict:
     except Exception as e:
         return {"error": str(e)}
 
-# ── Agent setup ───────────────────────────────────────────────────────────────
+# ── Agent ─────────────────────────────────────────────────────────────────────
 co = cohere.ClientV2(api_key)
-user_message = input("You: ")
 
-# conversation history — grows with every step of the loop
-messages = [{"role": "user", "content": user_message}]
+print("Agent ready. Type 'exit' to quit.\n")
 
-# ── Agent loop ────────────────────────────────────────────────────────────────
-iterations = 0
+# ── Outer loop — keeps the agent alive between inputs ─────────────────────────
+while True:
+    user_message = input("You: ")
 
-while iterations < 10:
-    # call the LLM with the full conversation history and tool definitions
-    response = co.chat(
-        model="command-r-plus-08-2024",
-        messages=messages,
-        tools=tools
-    )
-
-    if response.message.tool_calls:
-        # append the assistant's decision to history
-        # (Cohere needs this before the tool results)
-        messages.append(response.message)
-
-        # handle every tool call in this response
-        # (Cohere can request multiple tools at once)
-        for tool_call in response.message.tool_calls:
-            tool_name = tool_call.function.name
-            tool_args = json.loads(tool_call.function.arguments)
-
-            print(f"→ [{iterations + 1}] Calling: {tool_name}({tool_args})")
-
-            # execute the right function
-            if tool_name == "review_code":
-                result = review_code(tool_args["code"])
-            elif tool_name == "calculate":
-                result = calculate(tool_args["expression"])
-            else:
-                result = {"error": f"Unknown tool: {tool_name}"}
-
-            # append tool result to history
-            # tool_call_id links this result to the specific tool call
-            messages.append({
-                "role": "tool",
-                "content": json.dumps(result),
-                "tool_call_id": tool_call.id
-            })
-
-        iterations += 1
-
-    else:
-        # no tool calls — LLM is done, print final answer and exit loop
-        print(f"\n{response.message.content[0].text}")
+    # exit condition
+    if user_message.strip().lower() in ["exit", "quit"]:
+        print("Goodbye!")
         break
 
-else:
-    # while loop exhausted 10 iterations without a final answer
-    print("\n[Agent stopped — max iterations reached]")
+    # skip empty input
+    if not user_message.strip():
+        continue
+
+    # fresh conversation for each new input
+    messages = [{"role": "user", "content": user_message}]
+    iterations = 0
+
+    # ── Inner loop — agent runs until done or max iterations ──────────────────
+    while iterations < 10:
+        response = co.chat(
+            model="command-r-plus-08-2024",
+            messages=messages,
+            tools=tools
+        )
+
+        if response.message.tool_calls:
+            messages.append(response.message)
+
+            for tool_call in response.message.tool_calls:
+                tool_name = tool_call.function.name
+                tool_args = json.loads(tool_call.function.arguments)
+
+                print(f"→ [{iterations + 1}] Calling: {tool_name}({tool_args})")
+
+                if tool_name == "review_code":
+                    result = review_code(tool_args["code"])
+                elif tool_name == "calculate":
+                    result = calculate(tool_args["expression"])
+                else:
+                    result = {"error": f"Unknown tool: {tool_name}"}
+
+                messages.append({
+                    "role": "tool",
+                    "content": json.dumps(result),
+                    "tool_call_id": tool_call.id
+                })
+
+            iterations += 1
+
+        else:
+            print(f"\nAgent: {response.message.content[0].text}\n")
+            break
+
+    else:
+        print("\n[Agent stopped — max iterations reached]\n")
